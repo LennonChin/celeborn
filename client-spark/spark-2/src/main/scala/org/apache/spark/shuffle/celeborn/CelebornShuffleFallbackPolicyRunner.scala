@@ -30,78 +30,94 @@ class CelebornShuffleFallbackPolicyRunner(conf: CelebornConf) extends Logging {
   private val numPartitionsThreshold = conf.shuffleFallbackPartitionThreshold
 
   def applyAllFallbackPolicy(lifecycleManager: LifecycleManager, numPartitions: Int): Boolean = {
-    val needFallback =
-      applyForceFallbackPolicy() || applyShufflePartitionsFallbackPolicy(numPartitions) ||
-        !checkQuota(lifecycleManager) || !checkWorkersAvailable(lifecycleManager)
+    val (needFallback, reason) = Seq(
+      () => applyForceFallbackPolicy(),
+      () => applyShufflePartitionsFallbackPolicy(numPartitions),
+      () => checkQuota(lifecycleManager),
+      () => checkWorkersAvailable(lifecycleManager))
+      .foldLeft((false, Option.empty[String]))((pre, func) => {
+        if (pre._1) pre else func()
+      })
     if (needFallback && FallbackPolicy.NEVER.equals(shuffleFallbackPolicy)) {
-      throw new CelebornIOException(
-        "Fallback to spark built-in shuffle implementation is prohibited.")
+      val msg = "Fallback to Spark built-in shuffle implementation is prohibited, " +
+        s"fallback cause reason: ${reason.getOrElse("")}"
+      logError(msg)
+      throw new CelebornIOException(msg)
     }
     needFallback
   }
 
   /**
    * if celeborn.client.spark.shuffle.fallback.policy is ALWAYS, fallback to spark built-in shuffle implementation
-   * @return return true if celeborn.client.spark.shuffle.fallback.policy is ALWAYS, otherwise false
+   *
+   * @return return true and the reason if celeborn.client.spark.shuffle.fallback.policy is ALWAYS, otherwise false
    */
-  def applyForceFallbackPolicy(): Boolean = {
-    if (FallbackPolicy.ALWAYS.equals(shuffleFallbackPolicy)) {
-      logWarning(
-        s"${CelebornConf.SPARK_SHUFFLE_FALLBACK_POLICY.key} is ${FallbackPolicy.ALWAYS.name}, " +
-          s"forcibly fallback to spark built-in shuffle implementation.")
+  def applyForceFallbackPolicy(): (Boolean, Option[String]) = {
+    val needFallback = FallbackPolicy.ALWAYS.equals(shuffleFallbackPolicy)
+    if (needFallback) {
+      val msg = s"${CelebornConf.SPARK_SHUFFLE_FALLBACK_POLICY.key} is ${FallbackPolicy.ALWAYS.name}, " +
+        s"forcibly fallback to Spark built-in shuffle implementation."
+      logWarning(msg)
+      return (needFallback, Some(msg))
     }
-    FallbackPolicy.ALWAYS.equals(shuffleFallbackPolicy)
+    (needFallback, None)
   }
 
   /**
    * if shuffle partitions > celeborn.shuffle.fallback.numPartitionsThreshold, fallback to spark built-in
    * shuffle implementation
+   *
    * @param numPartitions shuffle partitions
-   * @return return true if shuffle partitions bigger than limit, otherwise false
+   * @return return true and the reason if shuffle partitions bigger than limit
    */
-  def applyShufflePartitionsFallbackPolicy(numPartitions: Int): Boolean = {
+  def applyShufflePartitionsFallbackPolicy(numPartitions: Int): (Boolean, Option[String]) = {
     val needFallback = numPartitions >= numPartitionsThreshold
     if (needFallback) {
-      logWarning(
-        s"Shuffle partition number: $numPartitions exceeds threshold: $numPartitionsThreshold, " +
-          "need to fallback to spark built-in shuffle implementation.")
+      val msg = s"Shuffle partition number: $numPartitions exceeds threshold: $numPartitionsThreshold, " +
+        "need to fallback to Spark built-in shuffle implementation."
+      logWarning(msg)
+      return (needFallback, Some(msg))
     }
-    needFallback
+    (needFallback, None)
   }
 
   /**
    * If celeborn cluster is exceed current user's quota, fallback to spark built-in shuffle implementation
    *
-   * @return if celeborn cluster have available space for current user
+   * @return return true and the reason if celeborn cluster doesn't have available space for current user
    */
-  def checkQuota(lifecycleManager: LifecycleManager): Boolean = {
+  def checkQuota(lifecycleManager: LifecycleManager): (Boolean, Option[String]) = {
     if (!quotaEnabled) {
-      return true
+      return (false, None)
     }
 
     val resp = lifecycleManager.checkQuota()
     if (!resp.isAvailable) {
-      logWarning(
-        s"Quota exceed for current user ${lifecycleManager.getUserIdentifier}. Because: ${resp.reason}")
+      val msg =
+        s"Quota exceed for current user ${lifecycleManager.getUserIdentifier}. Because: ${resp.reason}"
+      logWarning(msg)
+      return (!resp.isAvailable, Some(msg))
     }
-    resp.isAvailable
+    (!resp.isAvailable, None)
   }
 
   /**
    * If celeborn cluster has no available workers, fallback to spark built-in shuffle implementation
    *
-   * @return if celeborn cluster has available workers.
+   * @return return true and the reason if celeborn cluster doesn't have available workers.
    */
-  def checkWorkersAvailable(lifecycleManager: LifecycleManager): Boolean = {
+  def checkWorkersAvailable(lifecycleManager: LifecycleManager): (Boolean, Option[String]) = {
     if (!checkWorkerEnabled) {
-      return true
+      return (false, None)
     }
 
     val resp = lifecycleManager.checkWorkersAvailable()
     if (!resp.getAvailable) {
-      logWarning(
-        s"No celeborn workers available for current user ${lifecycleManager.getUserIdentifier}.")
+      val msg =
+        s"No celeborn workers available for current user ${lifecycleManager.getUserIdentifier}."
+      logWarning(msg)
+      return (!resp.getAvailable, Some(msg))
     }
-    resp.getAvailable
+    (!resp.getAvailable, None)
   }
 }
